@@ -23,20 +23,91 @@
 #include <sys/socket.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include "./ini.h"
 
 #define    print_err(format, args...)   printf("[%s:%d][err]" format "\n", __func__, __LINE__, ##args)
 #define    print_info(format, args...)   printf("[%s:%d][info]" format "\n", __func__, __LINE__, ##args)
 #define PORT 2000
 
+typedef struct
+{
+    int autostart;
+    int version;
+    const char* name;
+    const char* directory;
+    const char* cmdline;
+} configuration;
+
+static int handler(void* user, const char* section, const char* name,
+                   const char* value)
+{
+    configuration* pconfig = (configuration*)user;
+
+    #define MATCH(s, n) strcmp(section, s) == 0 && strcmp(name, n) == 0
+    if (MATCH("", "version")) {
+        pconfig->version = atoi(value);
+    } else if (MATCH("", "autostart")) {
+        pconfig->autostart = atoi(value);
+    } else if (MATCH("", "name")) {
+        pconfig->name = strdup(value);
+    } else if (MATCH("", "directory")) {
+        pconfig->directory = strdup(value);
+    } else if (MATCH("", "cmdline")) {
+        pconfig->cmdline = strdup(value);
+    } else {
+        return 0;  /* unknown section/name, error */
+    }
+    return 1;
+}
+
+configuration loadConfig(bool shutdown) {
+	configuration config;
+	config.autostart = 0;
+	config.version = 0;
+	config.name = "";
+	config.directory = "";
+	config.cmdline = "";
+	if(ini_parse("server.ini", handler, &config) < 0) {
+		perror("config");
+		if(shutdown) {
+			exit(1);
+		}
+	}
+	return config;
+}
 
 typedef struct State {
 	bool isQuiting;
 	pid_t processId;
 	int startTimeout;
 	int fdToServer;
-	int fdFromServer ;
+	int fdFromServer;
 	bool locked;
+	configuration configuration;
 } state;
+
+void sendState(int fd, state state) {
+	char string[64];
+	if(state.fdToServer == -1) {
+		// Server not running now
+		if(state.startTimeout > 0) {
+			strcpy(string, "Starting");
+		} else {
+			strcpy(string, "Stopped");
+		}
+	} else {
+		// server running at the moment
+		if(state.locked > 0) {
+			strcpy(string, "shutting down");
+		} else if(state.isQuiting) {
+			strcpy(string, "stopping");
+		} else {
+			strcpy(string, "running");
+		}
+	}
+	send(fd, string, strlen(string), 0);
+}
+
 
 int startSubprocess(state *state) {
 	int fromServer[2];
@@ -55,15 +126,21 @@ int startSubprocess(state *state) {
 		perror("fork");
 		exit(1);
 	} else if (pid == 0) {
-		while ((dup2(fromServer[1], STDOUT_FILENO) == -1) && (errno == EINTR)) {}
-		while ((dup2(fromServer[1], STDERR_FILENO) == -1) && (errno == EINTR)) {}
+		while ((dup2(fromServer[1], STDOUT_FILENO) == -1) && (errno == EINTR)) {
+		}
+		while ((dup2(fromServer[1], STDERR_FILENO) == -1) && (errno == EINTR)) {
+		}
 		close(fromServer[1]);
 		close(fromServer[0]);
-		while ((dup2(toServer[0], STDIN_FILENO) == -1) && (errno == EINTR)) {}
+		while ((dup2(toServer[0], STDIN_FILENO) == -1) && (errno == EINTR)) {
+		}
 		close(toServer[1]);
 		close(toServer[0]);
-		chdir("/home/fernando/Documents/mc");
-		execl("/bin/sh", "/bin/sh", "-c", "java -jar server.jar nogui", (char*)0);
+		if(chdir(state->configuration.directory) == -1) {
+			perror("chdir");
+			exit(1);
+		}
+		execl("/bin/sh", "/bin/sh", "-c", state->configuration.cmdline, (char*) 0);
 		perror("execl");
 		_exit(1);
 	}
@@ -76,155 +153,150 @@ int startSubprocess(state *state) {
 }
 
 // Method from http://stackoverflow.com/a/9830092 by Remy Lebeau
-int sgetline(int fd, char ** out)
-{
-    int buf_size = 0;
-    int in_buf = 0;
-    int ret;
-    char ch;
-    char * buffer = NULL;
-    char * new_buffer;
 
-    do
-    {
-        // read a single byte
-        ret = read(fd, &ch, 1);
-        if (ret < 1)
-        {
-            // error or disconnect
-            free(buffer);
-            return -1;
-        }
+int sgetline(int fd, char ** out) {
+	int buf_size = 0;
+	int in_buf = 0;
+	int ret;
+	char ch;
+	char * buffer = NULL;
+	char * new_buffer;
 
-        // has end of line been reached?
-        if (ch == '\n')
-            break; // yes
+	do {
+		// read a single byte
+		ret = read(fd, &ch, 1);
+		if (ret < 1) {
+			// error or disconnect
+			free(buffer);
+			return -1;
+		}
 
-        // is more memory needed?
-        if ((buf_size == 0) || (in_buf == buf_size))
-        {
-            buf_size += 128;
-            new_buffer = realloc(buffer, buf_size);
+		// has end of line been reached?
+		if (ch == '\n')
+			break; // yes
 
-            if (!new_buffer)
-            {
-                free(buffer);
-                return -1;
-            }
+		// is more memory needed?
+		if ((buf_size == 0) || (in_buf == buf_size)) {
+			buf_size += 128;
+			new_buffer = realloc(buffer, buf_size);
 
-            buffer = new_buffer;
-        }
+			if (!new_buffer) {
+				free(buffer);
+				return -1;
+			}
 
-        buffer[in_buf] = ch;
-        ++in_buf;
-    }
-    while (true);
+			buffer = new_buffer;
+		}
 
-    // if the line was terminated by "\r\n", ignore the
-    // "\r". the "\n" is not in the buffer
-    if ((in_buf > 0) && (buffer[in_buf-1] == '\r'))
-        --in_buf;
+		buffer[in_buf] = ch;
+		++in_buf;
+	} while (true);
 
-    // is more memory needed?
-    if ((buf_size == 0) || (in_buf == buf_size))
-    {
-        ++buf_size;
-        new_buffer = realloc(buffer, buf_size);
+	// if the line was terminated by "\r\n", ignore the
+	// "\r". the "\n" is not in the buffer
+	if ((in_buf > 0) && (buffer[in_buf - 1] == '\r'))
+		--in_buf;
 
-        if (!new_buffer)
-        {
-            free(buffer);
-            return -1;
-        }
+	// is more memory needed?
+	if ((buf_size == 0) || (in_buf == buf_size)) {
+		++buf_size;
+		new_buffer = realloc(buffer, buf_size);
 
-        buffer = new_buffer;
-    }
+		if (!new_buffer) {
+			free(buffer);
+			return -1;
+		}
 
-    // add a null terminator
-    buffer[in_buf] = '\0';
+		buffer = new_buffer;
+	}
 
-    *out = buffer; // complete line
+	// add a null terminator
+	buffer[in_buf] = '\0';
 
-    return in_buf; // number of chars in the line, not counting the line break and null terminator
+	*out = buffer; // complete line
+
+	return in_buf; // number of chars in the line, not counting the line break and null terminator
 }
 
 int main(int argc, char** argv) {
 	state state;
 	// Init states
 	state.isQuiting = false;
-	state.startTimeout = 1;
 	state.fdToServer = -1;
 	state.fdFromServer = -1;
 	state.processId = 0;
 	state.locked = false;
-	int connections [5] = { -1, -1, -1, -1, -1 };
+	state.configuration = loadConfig(false);
+	if (state.configuration.autostart) {
+		state.startTimeout = 1;
+	} else {
+		state.startTimeout = 0;
+	}
+	int connections [5] = {-1, -1, -1, -1, -1};
 	int connectionsLength = 5;
-	int openServerSockets [1] = { -1 };
+	int openServerSockets [1] = {-1};
 	int openServerSocketsLength = 1;
 
 	int opt = 1;
 	struct sockaddr_in address;
-	int addrlen = sizeof(address);
+	int addrlen = sizeof (address);
 	int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-	if(server_fd == 0) {
+	if (server_fd == 0) {
 		perror("Socket failed");
 		exit(EXIT_FAILURE);
 	}
 	// Forcefully attaching socket to the port 8080
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT,
-                                                  &opt, sizeof(opt)))
-    {
-        perror("setsockopt");
-        exit(EXIT_FAILURE);
-    }
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons( PORT );
+	if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT,
+			&opt, sizeof (opt))) {
+		perror("setsockopt");
+		exit(EXIT_FAILURE);
+	}
+	address.sin_family = AF_INET;
+	address.sin_addr.s_addr = INADDR_ANY;
+	address.sin_port = htons(PORT);
 
-    // Forcefully attaching socket to the port 8080
-    if (bind(server_fd, (struct sockaddr *)&address,
-                                 sizeof(address))<0)
-    {
-        perror("bind failed");
-        exit(EXIT_FAILURE);
-    }
-    if (listen(server_fd, 3) < 0)
-    {
-        perror("listen");
-        exit(EXIT_FAILURE);
-    }
+	// Forcefully attaching socket to the port 8080
+	if (bind(server_fd, (struct sockaddr *) &address,
+			sizeof (address)) < 0) {
+		perror("bind failed");
+		exit(EXIT_FAILURE);
+	}
+	if (listen(server_fd, 3) < 0) {
+		perror("listen");
+		exit(EXIT_FAILURE);
+	}
 
 	openServerSockets[0] = server_fd;
 
 	bool done = false;
 
-	while(!done) {
+	while (!done) {
 		print_info("Loop! %d", state.locked);
 		int maxfd = -1;
 		fd_set fds;
 		// Collect the list of file descriptors
 		{
 			FD_ZERO(&fds); // Clear FD set for select
-			if(state.fdFromServer != -1) {
+			if (state.fdFromServer != -1) {
 				FD_SET(state.fdFromServer, &fds);
 				maxfd = state.fdFromServer;
 			}
 			bool hasFreeConnectionSlot = false;
-			for(int i = 0; i < connectionsLength; i++) {
-				if(connections[i] != -1) {
+			for (int i = 0; i < connectionsLength; i++) {
+				if (connections[i] != -1) {
 					FD_SET(connections[i], &fds);
-					if(connections[i] > maxfd) {
+					if (connections[i] > maxfd) {
 						maxfd = connections[i];
 					}
 				} else {
 					hasFreeConnectionSlot = true;
 				}
 			}
-			if(hasFreeConnectionSlot) {
-				for(int i = 0; i < openServerSocketsLength; i++) {
-					if(openServerSockets[i] != -1) {
+			if (hasFreeConnectionSlot) {
+				for (int i = 0; i < openServerSocketsLength; i++) {
+					if (openServerSockets[i] != -1) {
 						FD_SET(openServerSockets[i], &fds);
-						if(openServerSockets[i] > maxfd) {
+						if (openServerSockets[i] > maxfd) {
 							maxfd = openServerSockets[i];
 						}
 					}
@@ -238,25 +310,25 @@ int main(int argc, char** argv) {
 			perror("select");
 		}
 		// Process data
-		for(int i = 0; i < connectionsLength; i++) {
-			if(connections[i] != -1) {
-				if(FD_ISSET(connections[i], &fds)) {
+		for (int i = 0; i < connectionsLength; i++) {
+			if (connections[i] != -1) {
+				if (FD_ISSET(connections[i], &fds)) {
 					print_info("Connection %d has data!", i);
 					char* line;
 					int read = sgetline(connections[i], &line);
 					print_info("Read %d byte from sockets!, line: %s", read, line);
 					if (read == -1) {
 						print_info("EOF on connection %d", i);
-						if(shutdown(connections[i], 2) == -1) {
+						if (shutdown(connections[i], 2) == -1) {
 							perror("socket_shutdown");
 						}
-						if(close(connections[i]) == -1) {
+						if (close(connections[i]) == -1) {
 							perror("socket_close");
 						}
 						connections[i] = -1;
 					} else {
 						char command = line[0];
-						if(command == 'c') { // command
+						if (command == 'c') { // command
 							memmove(line, line + 1, read);
 							line[read - 1] = '\n';
 							if (state.fdToServer != -1) {
@@ -264,28 +336,28 @@ int main(int argc, char** argv) {
 							} else {
 								print_info("Server not running!");
 							}
-						} else if(command == 'b') { // boot server
+						} else if (command == 'b') { // boot server
 							if (state.fdToServer == -1) {
 								state.startTimeout = 1;
 							} else {
 								print_info("Server already running!");
 							}
-						} else if(command == 's') { // stop
+						} else if (command == 's') { // stop
 							if (state.fdToServer != -1) {
 								state.isQuiting = true;
 								state.startTimeout = 0;
 							} else {
 								print_info("Server already running!");
 							}
-						} else if(command == 't') { // terminate
+						} else if (command == 't') { // terminate
 							if (state.fdToServer != -1) {
-								if(kill(state.processId, SIGTERM) == -1) {
+								if (kill(state.processId, SIGTERM) == -1) {
 									perror("kill");
 								}
 							} else {
 								print_info("Server not running!");
 							}
-						} else if(command == 'e') { // exit
+						} else if (command == 'e') { // exit
 							state.locked = true;
 							if (state.fdToServer != -1) {
 								state.isQuiting = true;
@@ -294,19 +366,19 @@ int main(int argc, char** argv) {
 						}
 					}
 					free(line);
-					
+
 				}
 			}
 		}
-		if(state.fdFromServer != -1) {
-			if(FD_ISSET(state.fdFromServer, &fds)) {
+		if (state.fdFromServer != -1) {
+			if (FD_ISSET(state.fdFromServer, &fds)) {
 				char buf[1024];
-				int readLen = read(state.fdFromServer, buf, sizeof(buf));
-				if(readLen < sizeof(buf)) {
+				int readLen = read(state.fdFromServer, buf, sizeof (buf));
+				if (readLen < sizeof (buf)) {
 					buf[readLen] = 0;
 				}
 				print_info("Read %d bytes from server!, %s", readLen, buf);
-				if(readLen == 0) {
+				if (readLen == 0) {
 					print_info("EOF on server");
 
 					close(state.fdToServer);
@@ -314,37 +386,38 @@ int main(int argc, char** argv) {
 					state.fdToServer = -1;
 					state.fdFromServer = -1;
 					int status;
-					if ( waitpid(state.processId, &status, 0) == -1 ) {
+					if (waitpid(state.processId, &status, 0) == -1) {
 						perror("waitpid() failed");
 					} else {
 						print_info("Exit code: %d", status);
 					}
 					state.processId = -1;
-					if(state.isQuiting) {
+					if (state.isQuiting) {
 						state.isQuiting = false;
 					} else {
 						// Automatic restart
 						state.startTimeout = 5;
 					}
 				} else {
-					for(int i = 0; i < connectionsLength; i++) {
-						if(connections[i] != -1) {
+					for (int i = 0; i < connectionsLength; i++) {
+						if (connections[i] != -1) {
 							send(connections[i], buf, readLen, 0);
 						}
 					}
 				}
 			}
 		}
-		for(int i = 0; i < openServerSocketsLength; i++) {
-			if(openServerSockets[i] != -1) {
-				if(FD_ISSET(openServerSockets[i], &fds)) {
+		for (int i = 0; i < openServerSocketsLength; i++) {
+			if (openServerSockets[i] != -1) {
+				if (FD_ISSET(openServerSockets[i], &fds)) {
 					print_info("Server socket %d has data!", i);
-					int newSocket = accept(openServerSockets[i], (struct sockaddr *)&address, (socklen_t*)&addrlen);
-					if(newSocket < 0) {
+					int newSocket = accept(openServerSockets[i], (struct sockaddr *) &address, (socklen_t*) & addrlen);
+					if (newSocket < 0) {
 						perror("accept");
 					} else {
-						for(int i = 0; i < connectionsLength; i++) {
-							if(connections[i] == -1) {
+						sendState(newSocket, state);
+						for (int i = 0; i < connectionsLength; i++) {
+							if (connections[i] == -1) {
 								connections[i] = newSocket;
 								break;
 							}
@@ -354,9 +427,9 @@ int main(int argc, char** argv) {
 			}
 		}
 		// Check server
-		if(state.startTimeout > 0 && !state.locked) {
+		if (state.startTimeout > 0 && !state.locked) {
 			state.startTimeout--;
-			if(state.startTimeout == 0 && !state.isQuiting) {
+			if (state.startTimeout == 0 && !state.isQuiting) {
 				startSubprocess(&state);
 			}
 		}
@@ -366,17 +439,17 @@ int main(int argc, char** argv) {
 	// Cleanup
 	print_info("Cleanup! %d %d", state.locked, (state.fdToServer == -1));
 
-	for(int i = 0; i < connectionsLength; i++) {
-		if(connections[i] != -1) {
-			if(close(connections[i]) == -1) {
-				perror('close');
+	for (int i = 0; i < connectionsLength; i++) {
+		if (connections[i] != -1) {
+			if (close(connections[i]) == -1) {
+				perror("close");
 			}
 		}
 	}
-	for(int i = 0; i < openServerSocketsLength; i++) {
-		if(openServerSockets[i] != -1) {
-			if(close(openServerSockets[i]) == -1) {
-				perror('close');
+	for (int i = 0; i < openServerSocketsLength; i++) {
+		if (openServerSockets[i] != -1) {
+			if (close(openServerSockets[i]) == -1) {
+				perror("close");
 			}
 		}
 	}
