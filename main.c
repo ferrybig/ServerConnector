@@ -24,40 +24,40 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include "./ini.h"
+#include "./pack.h"
 
 #define    print_err(format, args...)   printf("[%s:%d][err]" format "\n", __func__, __LINE__, ##args)
 #define    print_info(format, args...)   printf("[%s:%d][info]" format "\n", __func__, __LINE__, ##args)
 #define PORT 2000
 
-typedef struct
-{
-    int autostart;
-    int version;
-    const char* name;
-    const char* directory;
-    const char* cmdline;
+typedef struct Configuration {
+	int autostart;
+	int version;
+	bool invalid;
+	const char* name;
+	const char* directory;
+	const char* cmdline;
 } configuration;
 
-static int handler(void* user, const char* section, const char* name,
-                   const char* value)
-{
-    configuration* pconfig = (configuration*)user;
+static int config_handler(void* user, const char* section, const char* name,
+		const char* value) {
+	configuration* pconfig = (configuration*) user;
 
-    #define MATCH(s, n) strcmp(section, s) == 0 && strcmp(name, n) == 0
-    if (MATCH("", "version")) {
-        pconfig->version = atoi(value);
-    } else if (MATCH("", "autostart")) {
-        pconfig->autostart = atoi(value);
-    } else if (MATCH("", "name")) {
-        pconfig->name = strdup(value);
-    } else if (MATCH("", "directory")) {
-        pconfig->directory = strdup(value);
-    } else if (MATCH("", "cmdline")) {
-        pconfig->cmdline = strdup(value);
-    } else {
-        return 0;  /* unknown section/name, error */
-    }
-    return 1;
+#define MATCH(s, n) strcmp(section, s) == 0 && strcmp(name, n) == 0
+	if (MATCH("", "version")) {
+		pconfig->version = atoi(value);
+	} else if (MATCH("", "autostart")) {
+		pconfig->autostart = atoi(value);
+	} else if (MATCH("", "name")) {
+		pconfig->name = strdup(value);
+	} else if (MATCH("", "directory")) {
+		pconfig->directory = strdup(value);
+	} else if (MATCH("", "cmdline")) {
+		pconfig->cmdline = strdup(value);
+	} else {
+		return 0; /* unknown section/name, error */
+	}
+	return 1;
 }
 
 configuration loadConfig(bool shutdown) {
@@ -67,9 +67,10 @@ configuration loadConfig(bool shutdown) {
 	config.name = "";
 	config.directory = "";
 	config.cmdline = "";
-	if(ini_parse("server.ini", handler, &config) < 0) {
+	config.invalid = false;
+	if (ini_parse("server.ini", config_handler, &config) < 0) {
 		perror("config");
-		if(shutdown) {
+		if (shutdown) {
 			exit(1);
 		}
 	}
@@ -84,30 +85,68 @@ typedef struct State {
 	int fdFromServer;
 	bool locked;
 	configuration configuration;
+	int connections [5];
+	int connectionsLength;
+	int openServerSockets [1];
+	int openServerSocketsLength;
 } state;
 
-void sendState(int fd, state state) {
+state makeState(configuration config) {
+	state state = {
+		false,
+		-1,
+		config.autostart,
+		-1,
+		-1,
+		false,
+		config,
+		{ -1, -1, -1, -1, -1},
+		-1,
+		{ -1},
+		-1,
+	};
+	state.connectionsLength = sizeof(state.connections) / sizeof(state.connections[0]);
+	state.openServerSocketsLength = sizeof(state.openServerSockets) / sizeof(state.openServerSockets[0]);
+	return state;
+}
+
+int sendState(int fd, state* state) {
 	char string[64];
-	if(state.fdToServer == -1) {
+	if (state->fdToServer == -1) {
 		// Server not running now
-		if(state.startTimeout > 0) {
+		if (state->startTimeout > 0) {
 			strcpy(string, "Starting");
 		} else {
 			strcpy(string, "Stopped");
 		}
 	} else {
 		// server running at the moment
-		if(state.locked > 0) {
+		if (state->locked == true) {
 			strcpy(string, "shutting down");
-		} else if(state.isQuiting) {
+		} else if (state->isQuiting) {
 			strcpy(string, "stopping");
 		} else {
 			strcpy(string, "running");
 		}
 	}
-	send(fd, string, strlen(string), 0);
+	unsigned char buf[1024];
+	int packetsize = pack(buf + 1, "cs", (int8_t) 1, string);
+	print_info("Packet size: %d", packetsize);
+	buf[0] = (int8_t) packetsize;
+	return send(fd, buf, packetsize + 1, 0);
 }
 
+void sendStateAll(state* state) {
+	for (int i = 0; i < state->connectionsLength; i++) {
+		if (state->connections[i] != -1) {
+			if (sendState(state->connections[i], state) == -1) {
+				perror("sendState");
+				close(state->connections[i]);
+				state->connections[i] = -1;
+			}
+		}
+	}
+}
 
 int startSubprocess(state *state) {
 	int fromServer[2];
@@ -136,7 +175,7 @@ int startSubprocess(state *state) {
 		}
 		close(toServer[1]);
 		close(toServer[0]);
-		if(chdir(state->configuration.directory) == -1) {
+		if (chdir(state->configuration.directory) == -1) {
 			perror("chdir");
 			exit(1);
 		}
@@ -218,28 +257,217 @@ int sgetline(int fd, char ** out) {
 	return in_buf; // number of chars in the line, not counting the line break and null terminator
 }
 
-int main(int argc, char** argv) {
-	state state;
-	// Init states
-	state.isQuiting = false;
-	state.fdToServer = -1;
-	state.fdFromServer = -1;
-	state.processId = 0;
-	state.locked = false;
-	state.configuration = loadConfig(false);
-	if (state.configuration.autostart) {
-		state.startTimeout = 1;
-	} else {
-		state.startTimeout = 0;
+bool server_is_running(state * state) {
+	return state->fdToServer != -1 || state->startTimeout != 0;
+}
+
+void server_send_command(state * state, char * command) {
+	if (state->fdToServer != -1) {
+		if(write(state->fdToServer, command, strlen(command)) == -1) {
+			perror("server_send_command: write");
+		}
+		if(write(state->fdToServer, "\n", 1) == -1) {
+			perror("server_send_command: write");
+		}
 	}
-	int connections [5] = {-1, -1, -1, -1, -1};
-	int connectionsLength = 5;
-	int openServerSockets [1] = {-1};
-	int openServerSocketsLength = 1;
+}
+
+void server_start(state * state) {
+	if (state->fdToServer == -1 && state->startTimeout == 0) {
+		state->startTimeout = 1;
+		sendStateAll(state);
+	}
+}
+
+void server_stop(state * state) {
+	if (state->fdToServer != -1 || state->startTimeout != 0) {
+		state->isQuiting = true;
+		state->startTimeout = 0;
+		if (state->fdToServer != -1) {
+			server_send_command(state, "stop");
+		}
+		sendStateAll(state);
+	}
+}
+
+void server_terminate(state * state) {
+	if (server_is_running(state)) {
+		state->isQuiting = true;
+		state->startTimeout = 0;
+		if (state->processId != -1) {
+			if (kill(state->processId, SIGTERM) == -1) {
+				perror("kill");
+			}
+		}
+	}
+}
+
+void server_program_exit(state * state) {
+	server_stop(state);
+	state->locked = true;
+}
+
+bool receiveData(int fd, state * state, int i) {
+	char* line;
+	int read = sgetline(fd, &line);
+	if (read == -1) {
+		print_info("EOF on connection %d", i);
+		if (shutdown(fd, 2) == -1) {
+			perror("socket_shutdown");
+		}
+		if (close(fd) == -1) {
+			perror("socket_close");
+		}
+		return false;
+	} else {
+		print_info("Read %d byte from sockets!, line: %s", read, line);
+		char command = line[0];
+		if (command == 'c') { // command
+			//memmove(line, line + 1, read);
+			//line[read - 1] = 0;
+			server_send_command(state, line + 1);
+		} else if (command == 'b') { // boot server
+			server_start(state);
+		} else if (command == 's') { // stop
+			server_stop(state);
+		} else if (command == 't') { // terminate
+			server_terminate(state);
+		} else if (command == 'e') { // exit
+			server_program_exit(state);
+		}
+	}
+	free(line);
+	return true;
+}
+
+void loop(state* state) {
+	bool done = false;
+
+	while (!done) {
+		print_info("Loop!");
+		int maxfd = -1;
+		fd_set fds;
+		// Collect the list of file descriptors
+		int freeConnectionSlots = 0;
+		{
+			FD_ZERO(&fds); // Clear FD set for select
+			if (state->fdFromServer != -1) {
+				FD_SET(state->fdFromServer, &fds);
+				maxfd = state->fdFromServer;
+			}
+			for (int i = 0; i < state->connectionsLength; i++) {
+				if (state->connections[i] != -1) {
+					FD_SET(state->connections[i], &fds);
+					if (state->connections[i] > maxfd) {
+						maxfd = state->connections[i];
+					}
+				} else {
+					freeConnectionSlots += 1;
+				}
+			}
+			if (freeConnectionSlots > 0) {
+				for (int i = 0; i < state->openServerSocketsLength; i++) {
+					if (state->openServerSockets[i] != -1) {
+						FD_SET(state->openServerSockets[i], &fds);
+						if (state->openServerSockets[i] > maxfd) {
+							maxfd = state->openServerSockets[i];
+						}
+					}
+				}
+			}
+		}
+		// Select
+		struct timeval tv = {2, 0};
+		int code = select(maxfd + 1, &fds, NULL, NULL, &tv);
+		if (code == -1) {
+			perror("select");
+		}
+		// Process data
+		for (int i = 0; i < state->connectionsLength; i++) {
+			if (state->connections[i] != -1 && FD_ISSET(state->connections[i], &fds)) {
+				print_info("Connection %d has data!", i);
+				if(receiveData(state->connections[i], state, i) == false) {
+					print_info("EOF on connection %d!", i);
+					state->connections[i] = -1;
+				}
+			}
+		}
+		if (state->fdFromServer != -1) {
+			if (FD_ISSET(state->fdFromServer, &fds)) {
+				char buf[1024];
+				int readLen = read(state->fdFromServer, buf, sizeof (buf));
+				if (readLen < sizeof (buf)) {
+					buf[readLen] = 0;
+				}
+				print_info("Read %d bytes from server!, %s", readLen, buf);
+				if (readLen == 0) {
+					print_info("EOF on server");
+
+					close(state->fdToServer);
+					close(state->fdFromServer);
+					state->fdToServer = -1;
+					state->fdFromServer = -1;
+					int status;
+					if (waitpid(state->processId, &status, 0) == -1) {
+						perror("waitpid() failed");
+					} else {
+						print_info("Exit code: %d", status);
+					}
+					state->processId = -1;
+					if (state->isQuiting) {
+						state->isQuiting = false;
+					} else {
+						// Automatic restart
+						state->startTimeout = 5;
+					}
+					sendStateAll(state);
+				} else {
+					for (int i = 0; i < state->connectionsLength; i++) {
+						if (state->connections[i] != -1) {
+							send(state->connections[i], buf, readLen, 0);
+						}
+					}
+				}
+			}
+		}
+		for (int i = 0; i < state->openServerSocketsLength; i++) {
+			if (state->openServerSockets[i] != -1 && FD_ISSET(state->openServerSockets[i], &fds) && freeConnectionSlots > 0) {
+				print_info("Server socket %d has data!", i);
+				struct sockaddr_in address;
+				int addrlen = sizeof (address);
+				int newSocket = accept(state->openServerSockets[i], (struct sockaddr *) &address, (socklen_t*) & addrlen);
+				if (newSocket < 0) {
+					perror("accept");
+				} else {
+					sendState(newSocket, state);
+					for (int i = 0; i < state->connectionsLength; i++) {
+						if (state->connections[i] == -1) {
+							state->connections[i] = newSocket;
+							break;
+						}
+					}
+					freeConnectionSlots -= 1;
+				}
+			}
+		}
+		// Check server
+		if (state->startTimeout > 0 && !state->locked) {
+			state->startTimeout--;
+			if (state->startTimeout == 0 && !state->isQuiting) {
+				startSubprocess(state);
+				sendStateAll(state);
+			}
+		}
+
+		done = state->locked && (state->fdToServer == -1);
+	}
+}
+
+int main(int argc, char** argv) {
+	state state = makeState(loadConfig(true));
 
 	int opt = 1;
 	struct sockaddr_in address;
-	int addrlen = sizeof (address);
 	int server_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (server_fd == 0) {
 		perror("Socket failed");
@@ -266,193 +494,36 @@ int main(int argc, char** argv) {
 		exit(EXIT_FAILURE);
 	}
 
-	openServerSockets[0] = server_fd;
+	state.openServerSockets[0] = server_fd;
 
-	bool done = false;
+	loop(&state);
 
-	while (!done) {
-		print_info("Loop! %d", state.locked);
-		int maxfd = -1;
-		fd_set fds;
-		// Collect the list of file descriptors
-		{
-			FD_ZERO(&fds); // Clear FD set for select
-			if (state.fdFromServer != -1) {
-				FD_SET(state.fdFromServer, &fds);
-				maxfd = state.fdFromServer;
-			}
-			bool hasFreeConnectionSlot = false;
-			for (int i = 0; i < connectionsLength; i++) {
-				if (connections[i] != -1) {
-					FD_SET(connections[i], &fds);
-					if (connections[i] > maxfd) {
-						maxfd = connections[i];
-					}
-				} else {
-					hasFreeConnectionSlot = true;
-				}
-			}
-			if (hasFreeConnectionSlot) {
-				for (int i = 0; i < openServerSocketsLength; i++) {
-					if (openServerSockets[i] != -1) {
-						FD_SET(openServerSockets[i], &fds);
-						if (openServerSockets[i] > maxfd) {
-							maxfd = openServerSockets[i];
-						}
-					}
-				}
-			}
-		}
-		// Select
-		struct timeval tv = {2, 0};
-		int code = select(maxfd + 1, &fds, NULL, NULL, &tv);
-		if (code == -1) {
-			perror("select");
-		}
-		// Process data
-		for (int i = 0; i < connectionsLength; i++) {
-			if (connections[i] != -1) {
-				if (FD_ISSET(connections[i], &fds)) {
-					print_info("Connection %d has data!", i);
-					char* line;
-					int read = sgetline(connections[i], &line);
-					print_info("Read %d byte from sockets!, line: %s", read, line);
-					if (read == -1) {
-						print_info("EOF on connection %d", i);
-						if (shutdown(connections[i], 2) == -1) {
-							perror("socket_shutdown");
-						}
-						if (close(connections[i]) == -1) {
-							perror("socket_close");
-						}
-						connections[i] = -1;
-					} else {
-						char command = line[0];
-						if (command == 'c') { // command
-							memmove(line, line + 1, read);
-							line[read - 1] = '\n';
-							if (state.fdToServer != -1) {
-								write(state.fdToServer, line, read);
-							} else {
-								print_info("Server not running!");
-							}
-						} else if (command == 'b') { // boot server
-							if (state.fdToServer == -1) {
-								state.startTimeout = 1;
-							} else {
-								print_info("Server already running!");
-							}
-						} else if (command == 's') { // stop
-							if (state.fdToServer != -1) {
-								state.isQuiting = true;
-								state.startTimeout = 0;
-							} else {
-								print_info("Server already running!");
-							}
-						} else if (command == 't') { // terminate
-							if (state.fdToServer != -1) {
-								if (kill(state.processId, SIGTERM) == -1) {
-									perror("kill");
-								}
-							} else {
-								print_info("Server not running!");
-							}
-						} else if (command == 'e') { // exit
-							state.locked = true;
-							if (state.fdToServer != -1) {
-								state.isQuiting = true;
-								state.startTimeout = 0;
-							}
-						}
-					}
-					free(line);
-
-				}
-			}
-		}
-		if (state.fdFromServer != -1) {
-			if (FD_ISSET(state.fdFromServer, &fds)) {
-				char buf[1024];
-				int readLen = read(state.fdFromServer, buf, sizeof (buf));
-				if (readLen < sizeof (buf)) {
-					buf[readLen] = 0;
-				}
-				print_info("Read %d bytes from server!, %s", readLen, buf);
-				if (readLen == 0) {
-					print_info("EOF on server");
-
-					close(state.fdToServer);
-					close(state.fdFromServer);
-					state.fdToServer = -1;
-					state.fdFromServer = -1;
-					int status;
-					if (waitpid(state.processId, &status, 0) == -1) {
-						perror("waitpid() failed");
-					} else {
-						print_info("Exit code: %d", status);
-					}
-					state.processId = -1;
-					if (state.isQuiting) {
-						state.isQuiting = false;
-					} else {
-						// Automatic restart
-						state.startTimeout = 5;
-					}
-				} else {
-					for (int i = 0; i < connectionsLength; i++) {
-						if (connections[i] != -1) {
-							send(connections[i], buf, readLen, 0);
-						}
-					}
-				}
-			}
-		}
-		for (int i = 0; i < openServerSocketsLength; i++) {
-			if (openServerSockets[i] != -1) {
-				if (FD_ISSET(openServerSockets[i], &fds)) {
-					print_info("Server socket %d has data!", i);
-					int newSocket = accept(openServerSockets[i], (struct sockaddr *) &address, (socklen_t*) & addrlen);
-					if (newSocket < 0) {
-						perror("accept");
-					} else {
-						sendState(newSocket, state);
-						for (int i = 0; i < connectionsLength; i++) {
-							if (connections[i] == -1) {
-								connections[i] = newSocket;
-								break;
-							}
-						}
-					}
-				}
-			}
-		}
-		// Check server
-		if (state.startTimeout > 0 && !state.locked) {
-			state.startTimeout--;
-			if (state.startTimeout == 0 && !state.isQuiting) {
-				startSubprocess(&state);
-			}
-		}
-
-		done = state.locked && (state.fdToServer == -1);
-	}
 	// Cleanup
 	print_info("Cleanup! %d %d", state.locked, (state.fdToServer == -1));
 
-	for (int i = 0; i < connectionsLength; i++) {
-		if (connections[i] != -1) {
-			if (close(connections[i]) == -1) {
+	for (int i = 0; i < state.connectionsLength; i++) {
+		if (state.connections[i] != -1) {
+			if (sendState(state.connections[i], &state) == -1) {
+				perror("close: sendstate");
+			}
+			if (shutdown(state.connections[i], 2) == -1) {
+				perror("close");
+			}
+			if (close(state.connections[i]) == -1) {
 				perror("close");
 			}
 		}
 	}
-	for (int i = 0; i < openServerSocketsLength; i++) {
-		if (openServerSockets[i] != -1) {
-			if (close(openServerSockets[i]) == -1) {
+	for (int i = 0; i < state.openServerSocketsLength; i++) {
+		if (state.openServerSockets[i] != -1) {
+			if (close(state.openServerSockets[i]) == -1) {
 				perror("close");
 			}
 		}
 	}
+	//free(state.configuration.cmdline);
+	//free(state.configuration.directory);
+	//free(state.configuration.name);
 	print_info("Cleanup done!");
 
 	return (EXIT_SUCCESS);
