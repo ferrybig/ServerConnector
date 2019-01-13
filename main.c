@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include "./ini.h"
@@ -29,6 +30,22 @@
 #define    print_err(format, args...)   printf("[%s:%d][err]" format "\n", __func__, __LINE__, ##args)
 #define    print_info(format, args...)   printf("[%s:%d][info]" format "\n", __func__, __LINE__, ##args)
 #define PORT 2000
+
+static volatile int signalTerminateSeen = 0;
+
+void signalHandler(int signal) {
+	if (signal == SIGINT) { // Console ctrl + c
+		signalTerminateSeen = 1;
+	}
+	if (signal == SIGTERM) { // Terminate
+		signalTerminateSeen = 1;
+	}
+}
+
+int8_t PACKET_STATE_ID = (int8_t) 1;
+char* PACKET_STATE_FORMAT = "cs";
+int8_t PACKET_OUTPUT_ID = (int8_t) 2;
+char* PACKET_OUTPUT_FORMAT = "cs";
 
 typedef struct Configuration {
 	int autostart;
@@ -105,8 +122,8 @@ state makeState(configuration config) {
 		{ -1},
 		-1,
 	};
-	state.connectionsLength = sizeof(state.connections) / sizeof(state.connections[0]);
-	state.openServerSocketsLength = sizeof(state.openServerSockets) / sizeof(state.openServerSockets[0]);
+	state.connectionsLength = sizeof (state.connections) / sizeof (state.connections[0]);
+	state.openServerSocketsLength = sizeof (state.openServerSockets) / sizeof (state.openServerSockets[0]);
 	return state;
 }
 
@@ -130,10 +147,8 @@ int sendState(int fd, state* state) {
 		}
 	}
 	unsigned char buf[1024];
-	int packetsize = pack(buf + 1, "cs", (int8_t) 1, string);
-	print_info("Packet size: %d", packetsize);
-	buf[0] = (int8_t) packetsize;
-	return send(fd, buf, packetsize + 1, 0);
+	int packetsize = pack(buf, PACKET_STATE_FORMAT, PACKET_STATE_ID, string);
+	return send(fd, buf, packetsize, 0);
 }
 
 void sendStateAll(state* state) {
@@ -263,10 +278,10 @@ bool server_is_running(state * state) {
 
 void server_send_command(state * state, char * command) {
 	if (state->fdToServer != -1) {
-		if(write(state->fdToServer, command, strlen(command)) == -1) {
+		if (write(state->fdToServer, command, strlen(command)) == -1) {
 			perror("server_send_command: write");
 		}
-		if(write(state->fdToServer, "\n", 1) == -1) {
+		if (write(state->fdToServer, "\n", 1) == -1) {
 			perror("server_send_command: write");
 		}
 	}
@@ -344,7 +359,7 @@ void loop(state* state) {
 	bool done = false;
 
 	while (!done) {
-		print_info("Loop!");
+		//print_info("Loop! %d", signalTerminateSeen);
 		int maxfd = -1;
 		fd_set fds;
 		// Collect the list of file descriptors
@@ -378,15 +393,21 @@ void loop(state* state) {
 		}
 		// Select
 		struct timeval tv = {2, 0};
-		int code = select(maxfd + 1, &fds, NULL, NULL, &tv);
-		if (code == -1) {
+		int select_result;
+select:
+		select_result = select(maxfd + 1, &fds, NULL, NULL, &tv);
+		if (select_result == -1) {
+			if (errno == EINTR) { // Interrupted system call
+				print_info("Interrupted system call detected");
+				goto select;
+			}
 			perror("select");
 		}
 		// Process data
 		for (int i = 0; i < state->connectionsLength; i++) {
 			if (state->connections[i] != -1 && FD_ISSET(state->connections[i], &fds)) {
 				print_info("Connection %d has data!", i);
-				if(receiveData(state->connections[i], state, i) == false) {
+				if (receiveData(state->connections[i], state, i) == false) {
 					print_info("EOF on connection %d!", i);
 					state->connections[i] = -1;
 				}
@@ -399,6 +420,7 @@ void loop(state* state) {
 				if (readLen < sizeof (buf)) {
 					buf[readLen] = 0;
 				}
+
 				print_info("Read %d bytes from server!, %s", readLen, buf);
 				if (readLen == 0) {
 					print_info("EOF on server");
@@ -422,9 +444,12 @@ void loop(state* state) {
 					}
 					sendStateAll(state);
 				} else {
+
+					unsigned char packet_buf[1027];
+					int packetsize = pack(packet_buf, PACKET_OUTPUT_FORMAT, PACKET_OUTPUT_ID, buf);
 					for (int i = 0; i < state->connectionsLength; i++) {
 						if (state->connections[i] != -1) {
-							send(state->connections[i], buf, readLen, 0);
+							send(state->connections[i], packet_buf, packetsize, 0);
 						}
 					}
 				}
@@ -449,6 +474,12 @@ void loop(state* state) {
 					freeConnectionSlots -= 1;
 				}
 			}
+		}
+		// Check signal states
+		if (signalTerminateSeen > 0) {
+			print_info("Terminate signal caught!");
+			signalTerminateSeen = 0;
+			server_program_exit(state);
 		}
 		// Check server
 		if (state->startTimeout > 0 && !state->locked) {
@@ -495,6 +526,9 @@ int main(int argc, char** argv) {
 	}
 
 	state.openServerSockets[0] = server_fd;
+
+	signal(SIGINT, signalHandler);
+	signal(SIGTERM, signalHandler);
 
 	loop(&state);
 
