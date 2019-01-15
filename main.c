@@ -77,7 +77,7 @@ static int config_handler(void* user, const char* section, const char* name,
 	return 1;
 }
 
-configuration loadConfig(bool shutdown) {
+configuration loadConfig(char * file, bool shutdown) {
 	configuration config;
 	config.autostart = 0;
 	config.version = 0;
@@ -85,7 +85,7 @@ configuration loadConfig(bool shutdown) {
 	config.directory = "";
 	config.cmdline = "";
 	config.invalid = false;
-	if (ini_parse("server.ini", config_handler, &config) < 0) {
+	if (ini_parse(file, config_handler, &config) < 0) {
 		perror("config");
 		if (shutdown) {
 			exit(1);
@@ -494,8 +494,21 @@ select:
 	}
 }
 
+typedef struct ProgramOptions {
+	char * configFile;
+	char * pidfile;
+} programoptions;
+
 int main(int argc, char** argv) {
-	state state = makeState(loadConfig(true));
+	programoptions programoptions = { "server.ini", NULL };
+	if(argc > 1) {
+		programoptions.configFile = argv[1];
+		if(argc > 2) {
+			programoptions.pidfile = argv[2];
+		}
+	}
+
+	state state = makeState(loadConfig(programoptions.configFile, true));
 
 	int opt = 1;
 	struct sockaddr_in address;
