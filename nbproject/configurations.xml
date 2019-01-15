@@ -29,6 +29,7 @@
                    kind="IMPORTANT_FILES_FOLDER">
       <itemPath>Makefile</itemPath>
     </logicalFolder>
+    <itemPath>README.md</itemPath>
     <itemPath>server.ini</itemPath>
   </logicalFolder>
   <projectmakefile>Makefile</projectmakefile>
@@ -41,6 +42,8 @@
       </toolsSet>
       <compileType>
       </compileType>
+      <item path="README.md" ex="false" tool="3" flavor2="0">
+      </item>
       <item path="ini.c" ex="false" tool="0" flavor2="0">
       </item>
       <item path="ini.h" ex="false" tool="3" flavor2="0">
@@ -74,6 +77,8 @@
           <developmentMode>5</developmentMode>
         </asmTool>
       </compileType>
+      <item path="README.md" ex="false" tool="3" flavor2="0">
+      </item>
       <item path="ini.c" ex="false" tool="0" flavor2="0">
       </item>
       <item path="ini.h" ex="false" tool="3" flavor2="0">
