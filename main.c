@@ -24,6 +24,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include "./ini.h"
 #include "./pack.h"
 
@@ -51,9 +52,10 @@ typedef struct Configuration {
 	int autostart;
 	int version;
 	bool invalid;
-	const char* name;
-	const char* directory;
-	const char* cmdline;
+	int wrapper_port;
+	char* name;
+	char* directory;
+	char* cmdline;
 } configuration;
 
 static int config_handler(void* user, const char* section, const char* name,
@@ -65,6 +67,8 @@ static int config_handler(void* user, const char* section, const char* name,
 		pconfig->version = atoi(value);
 	} else if (MATCH("", "autostart")) {
 		pconfig->autostart = atoi(value);
+	} else if (MATCH("", "wrapper_port")) {
+		pconfig->wrapper_port = atoi(value);
 	} else if (MATCH("", "name")) {
 		pconfig->name = strdup(value);
 	} else if (MATCH("", "directory")) {
@@ -81,6 +85,7 @@ configuration loadConfig(char * file, bool shutdown) {
 	configuration config;
 	config.autostart = 0;
 	config.version = 0;
+	config.wrapper_port = 0;
 	config.name = "";
 	config.directory = "";
 	config.cmdline = "";
@@ -464,6 +469,11 @@ select:
 				if (newSocket < 0) {
 					perror("accept");
 				} else {
+					struct sockaddr_in6* pV6Addr = (struct sockaddr_in6*) &address;
+					struct in6_addr ipAddr = pV6Addr->sin6_addr;
+					char str[INET6_ADDRSTRLEN];
+					inet_ntop(AF_INET6, &ipAddr, str, INET6_ADDRSTRLEN);
+					print_info("Incoming connection! %s:%d", str, address.sin_port);
 					sendState(newSocket, state);
 					for (int i = 0; i < state->connectionsLength; i++) {
 						if (state->connections[i] == -1) {
@@ -494,16 +504,24 @@ select:
 	}
 }
 
+in_port_t get_in_port(const struct sockaddr *sa)
+{
+    if( sa->sa_family == AF_INET ) // IPv4 address
+        return (((struct sockaddr_in*)sa)->sin_port);
+    // else IPv6 address
+    return (((struct sockaddr_in6*)sa)->sin6_port);
+}
+
 typedef struct ProgramOptions {
 	char * configFile;
 	char * pidfile;
 } programoptions;
 
 int main(int argc, char** argv) {
-	programoptions programoptions = { "server.ini", NULL };
-	if(argc > 1) {
+	programoptions programoptions = {"server.ini", NULL};
+	if (argc > 1) {
 		programoptions.configFile = argv[1];
-		if(argc > 2) {
+		if (argc > 2) {
 			programoptions.pidfile = argv[2];
 		}
 	}
@@ -511,25 +529,28 @@ int main(int argc, char** argv) {
 	state state = makeState(loadConfig(programoptions.configFile, true));
 
 	int opt = 1;
-	struct sockaddr_in address;
-	int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+	struct sockaddr_in6 address;
+	int server_fd = socket(AF_INET6, SOCK_STREAM, 0);
 	if (server_fd == 0) {
 		perror("Socket failed");
 		exit(EXIT_FAILURE);
 	}
-	// Forcefully attaching socket to the port 8080
 	if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT,
 			&opt, sizeof (opt))) {
 		perror("setsockopt");
 		exit(EXIT_FAILURE);
 	}
-	address.sin_family = AF_INET;
-	address.sin_addr.s_addr = INADDR_ANY;
-	address.sin_port = htons(PORT);
+	int on = 0;
+	if (setsockopt(server_fd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on))) {
+		perror("setsockopt");
+		exit(EXIT_FAILURE);
+	}
+	address.sin6_family = AF_INET6;
+	address.sin6_addr = in6addr_any;
+	address.sin6_port = htons(state.configuration.wrapper_port);
 
-	// Forcefully attaching socket to the port 8080
-	if (bind(server_fd, (struct sockaddr *) &address,
-			sizeof (address)) < 0) {
+	// Forcefully attaching socket to the port specified in the config
+	if (bind(server_fd, (struct sockaddr *) &address, sizeof (address)) < 0) {
 		perror("bind failed");
 		exit(EXIT_FAILURE);
 	}
@@ -537,6 +558,15 @@ int main(int argc, char** argv) {
 		perror("listen");
 		exit(EXIT_FAILURE);
 	}
+
+	struct sockaddr_storage address_bound;
+	socklen_t len = sizeof (address_bound); // TODO fix bug
+	if (getsockname(server_fd, (struct sockaddr *) &address_bound, &len) < 0) {
+		perror("getsockname");
+		exit(EXIT_FAILURE);
+	}
+
+	print_info("Running on port %d", get_in_port((struct sockaddr*)(&address_bound)));
 
 	state.openServerSockets[0] = server_fd;
 
@@ -568,9 +598,9 @@ int main(int argc, char** argv) {
 			}
 		}
 	}
-	//free(state.configuration.cmdline);
-	//free(state.configuration.directory);
-	//free(state.configuration.name);
+	free(state.configuration.cmdline);
+	free(state.configuration.directory);
+	free(state.configuration.name);
 	print_info("Cleanup done!");
 
 	return (EXIT_SUCCESS);
