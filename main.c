@@ -494,7 +494,7 @@ select:
 		// Check server
 		if (state->startTimeout > 0 && !state->locked) {
 			state->startTimeout--;
-			if (state->startTimeout == 0 && !state->isQuiting) {
+			if (state->startTimeout == 0 && !state->isQuiting && state->fdFromServer == -1) {
 				startSubprocess(state);
 				sendStateAll(state);
 			}
@@ -504,20 +504,17 @@ select:
 	}
 }
 
-in_port_t get_in_port(const struct sockaddr *sa)
-{
-    if( sa->sa_family == AF_INET ) // IPv4 address
-        return (((struct sockaddr_in*)sa)->sin_port);
-    // else IPv6 address
-    return (((struct sockaddr_in6*)sa)->sin6_port);
-}
-
 typedef struct ProgramOptions {
 	char * configFile;
 	char * pidfile;
 } programoptions;
 
 int main(int argc, char** argv) {
+	// Bootstrap
+	setvbuf(stdout, NULL, _IONBF, 0);
+	setvbuf(stderr, NULL, _IONBF, 0);
+
+	// Init program
 	programoptions programoptions = {"server.ini", NULL};
 	if (argc > 1) {
 		programoptions.configFile = argv[1];
@@ -540,8 +537,8 @@ int main(int argc, char** argv) {
 		perror("setsockopt");
 		exit(EXIT_FAILURE);
 	}
-	int on = 0;
-	if (setsockopt(server_fd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on))) {
+	int off = 0;
+	if (setsockopt(server_fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off))) {
 		perror("setsockopt");
 		exit(EXIT_FAILURE);
 	}
@@ -549,7 +546,6 @@ int main(int argc, char** argv) {
 	address.sin6_addr = in6addr_any;
 	address.sin6_port = htons(state.configuration.wrapper_port);
 
-	// Forcefully attaching socket to the port specified in the config
 	if (bind(server_fd, (struct sockaddr *) &address, sizeof (address)) < 0) {
 		perror("bind failed");
 		exit(EXIT_FAILURE);
@@ -559,20 +555,28 @@ int main(int argc, char** argv) {
 		exit(EXIT_FAILURE);
 	}
 
-	struct sockaddr_storage address_bound;
-	socklen_t len = sizeof (address_bound); // TODO fix bug
+	struct sockaddr_in6 address_bound = {0};
+	socklen_t len = sizeof (address_bound);
+	char str_addr[INET6_ADDRSTRLEN];
+
 	if (getsockname(server_fd, (struct sockaddr *) &address_bound, &len) < 0) {
 		perror("getsockname");
 		exit(EXIT_FAILURE);
 	}
+	if (inet_ntop(AF_INET6, &(address_bound.sin6_addr), str_addr, sizeof(str_addr)) == NULL) {
+		perror("inet_ntop");
+		exit(EXIT_FAILURE);
+	}
 
-	print_info("Running on port %d", get_in_port((struct sockaddr*)(&address_bound)));
+	print_info("Running on [%s]:%d", str_addr, htons(address_bound.sin6_port));
 
 	state.openServerSockets[0] = server_fd;
 
 	signal(SIGINT, signalHandler);
 	signal(SIGTERM, signalHandler);
+	print_info("Server ready");
 
+	// Loop
 	loop(&state);
 
 	// Cleanup
