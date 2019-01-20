@@ -463,17 +463,20 @@ select:
 		for (int i = 0; i < state->openServerSocketsLength; i++) {
 			if (state->openServerSockets[i] != -1 && FD_ISSET(state->openServerSockets[i], &fds) && freeConnectionSlots > 0) {
 				print_info("Server socket %d has data!", i);
-				struct sockaddr_in address;
-				int addrlen = sizeof (address);
-				int newSocket = accept(state->openServerSockets[i], (struct sockaddr *) &address, (socklen_t*) & addrlen);
+				struct sockaddr_in6 address_bound = {0};
+				socklen_t len = sizeof (address_bound);
+				int newSocket = accept(state->openServerSockets[i], (struct sockaddr *) &address_bound, &len);
 				if (newSocket < 0) {
 					perror("accept");
 				} else {
-					struct sockaddr_in6* pV6Addr = (struct sockaddr_in6*) &address;
-					struct in6_addr ipAddr = pV6Addr->sin6_addr;
-					char str[INET6_ADDRSTRLEN];
-					inet_ntop(AF_INET6, &ipAddr, str, INET6_ADDRSTRLEN);
-					print_info("Incoming connection! %s:%d", str, address.sin_port);
+					char str_addr[INET6_ADDRSTRLEN];
+
+					if (inet_ntop(AF_INET6, &(address_bound.sin6_addr), str_addr, sizeof (str_addr)) == NULL) {
+						perror("inet_ntop");
+						exit(EXIT_FAILURE);
+					}
+
+					print_info("Incoming connection! [%s]:%d", str_addr, address_bound.sin6_port);
 					sendState(newSocket, state);
 					for (int i = 0; i < state->connectionsLength; i++) {
 						if (state->connections[i] == -1) {
@@ -538,7 +541,7 @@ int main(int argc, char** argv) {
 		exit(EXIT_FAILURE);
 	}
 	int off = 0;
-	if (setsockopt(server_fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off))) {
+	if (setsockopt(server_fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof (off))) {
 		perror("setsockopt");
 		exit(EXIT_FAILURE);
 	}
@@ -563,7 +566,7 @@ int main(int argc, char** argv) {
 		perror("getsockname");
 		exit(EXIT_FAILURE);
 	}
-	if (inet_ntop(AF_INET6, &(address_bound.sin6_addr), str_addr, sizeof(str_addr)) == NULL) {
+	if (inet_ntop(AF_INET6, &(address_bound.sin6_addr), str_addr, sizeof (str_addr)) == NULL) {
 		perror("inet_ntop");
 		exit(EXIT_FAILURE);
 	}
