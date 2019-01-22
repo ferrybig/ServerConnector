@@ -420,8 +420,8 @@ select:
 		}
 		if (state->fdFromServer != -1) {
 			if (FD_ISSET(state->fdFromServer, &fds)) {
-				char buf[1024];
-				int readLen = read(state->fdFromServer, buf, sizeof (buf));
+				char buf[1025];
+				int readLen = read(state->fdFromServer, buf, sizeof (buf) -1);
 				if (readLen < sizeof (buf)) {
 					buf[readLen] = 0;
 				}
