@@ -48,6 +48,11 @@ char* PACKET_STATE_FORMAT = "cs";
 int8_t PACKET_OUTPUT_ID = (int8_t) 2;
 char* PACKET_OUTPUT_FORMAT = "cs";
 
+typedef struct ProgramOptions {
+	char * configFile;
+	char * pidfile;
+} programoptions;
+
 typedef struct Configuration {
 	int autostart;
 	int version;
@@ -81,7 +86,7 @@ static int config_handler(void* user, const char* section, const char* name,
 	return 1;
 }
 
-configuration loadConfig(char * file, bool shutdown) {
+configuration loadConfig(programoptions options, bool shutdown) {
 	configuration config;
 	config.autostart = 0;
 	config.version = 0;
@@ -90,13 +95,19 @@ configuration loadConfig(char * file, bool shutdown) {
 	config.directory = "";
 	config.cmdline = "";
 	config.invalid = false;
-	if (ini_parse(file, config_handler, &config) < 0) {
+	if (ini_parse(options.configFile, config_handler, &config) < 0) {
 		perror("config");
 		if (shutdown) {
 			exit(1);
 		}
 	}
 	return config;
+}
+
+void free_config(configuration * config) {
+	free(config->cmdline);
+	free(config->directory);
+	free(config->name);
 }
 
 typedef struct State {
@@ -111,9 +122,10 @@ typedef struct State {
 	int connectionsLength;
 	int openServerSockets [1];
 	int openServerSocketsLength;
+	programoptions options;
 } state;
 
-state makeState(configuration config) {
+state makeState(configuration config, programoptions options) {
 	state state = {
 		false,
 		-1,
@@ -126,6 +138,7 @@ state makeState(configuration config) {
 		-1,
 		{ -1},
 		-1,
+		options,
 	};
 	state.connectionsLength = sizeof (state.connections) / sizeof (state.connections[0]);
 	state.openServerSocketsLength = sizeof (state.openServerSockets) / sizeof (state.openServerSockets[0]);
@@ -136,10 +149,12 @@ int sendState(int fd, state* state) {
 	char string[64];
 	if (state->fdToServer == -1) {
 		// Server not running now
-		if (state->startTimeout > 0) {
-			strcpy(string, "Starting");
+		if (state->locked == true) {
+			strcpy(string, "ended");
+		} else if (state->startTimeout > 0) {
+			strcpy(string, "starting");
 		} else {
-			strcpy(string, "Stopped");
+			strcpy(string, "stopped");
 		}
 	} else {
 		// server running at the moment
@@ -327,6 +342,19 @@ void server_program_exit(state * state) {
 	state->locked = true;
 }
 
+void server_reload_config(state * state) {
+	configuration config = loadConfig(state->options, false);
+	if (config.version > 0) {
+		// config load succesful
+		free_config(&state->configuration);
+		state->configuration = config;
+		print_info("Reloaded config");
+	} else {
+		// config laod error
+		free_config(&config);
+	}
+}
+
 bool receiveData(int fd, state * state, int i) {
 	char* line;
 	int read = sgetline(fd, &line);
@@ -354,6 +382,8 @@ bool receiveData(int fd, state * state, int i) {
 			server_terminate(state);
 		} else if (command == 'e') { // exit
 			server_program_exit(state);
+		} else if (command == 'r') { // reload config
+			server_reload_config(state);
 		}
 	}
 	free(line);
@@ -421,7 +451,7 @@ select:
 		if (state->fdFromServer != -1) {
 			if (FD_ISSET(state->fdFromServer, &fds)) {
 				char buf[1025];
-				int readLen = read(state->fdFromServer, buf, sizeof (buf) -1);
+				int readLen = read(state->fdFromServer, buf, sizeof (buf) - 1);
 				if (readLen < sizeof (buf)) {
 					buf[readLen] = 0;
 				}
@@ -507,11 +537,6 @@ select:
 	}
 }
 
-typedef struct ProgramOptions {
-	char * configFile;
-	char * pidfile;
-} programoptions;
-
 int main(int argc, char** argv) {
 	// Bootstrap
 	setvbuf(stdout, NULL, _IONBF, 0);
@@ -526,7 +551,7 @@ int main(int argc, char** argv) {
 		}
 	}
 
-	state state = makeState(loadConfig(programoptions.configFile, true));
+	state state = makeState(loadConfig(programoptions, true), programoptions);
 
 	int opt = 1;
 	struct sockaddr_in6 address;
@@ -583,7 +608,7 @@ int main(int argc, char** argv) {
 	loop(&state);
 
 	// Cleanup
-	print_info("Cleanup! %d %d", state.locked, (state.fdToServer == -1));
+	print_info("Cleanup!");
 
 	for (int i = 0; i < state.connectionsLength; i++) {
 		if (state.connections[i] != -1) {
@@ -605,9 +630,7 @@ int main(int argc, char** argv) {
 			}
 		}
 	}
-	free(state.configuration.cmdline);
-	free(state.configuration.directory);
-	free(state.configuration.name);
+	free_config(&state.configuration);
 	print_info("Cleanup done!");
 
 	return (EXIT_SUCCESS);
