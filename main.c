@@ -325,6 +325,14 @@ void server_stop(state * state) {
 	}
 }
 
+void server_restart(state * state) {
+	if (state->fdToServer != -1 || state->startTimeout != 0) {
+		if (state->fdToServer != -1) {
+			server_send_command(state, "stop");
+		}
+	}
+}
+
 void server_terminate(state * state) {
 	if (server_is_running(state)) {
 		state->isQuiting = true;
@@ -384,6 +392,8 @@ bool receiveData(int fd, state * state, int i) {
 			server_program_exit(state);
 		} else if (command == 'r') { // reload config
 			server_reload_config(state);
+		} else if (command == 'R') { // restart server
+			server_restart(state);
 		}
 	}
 	free(line);
